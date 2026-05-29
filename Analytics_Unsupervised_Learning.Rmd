@@ -1,0 +1,1273 @@
+---
+title: "Analytics Assignment 3 – Airbnb Cape Town"
+output: html_document
+date: "2026-05-11"
+---
+
+```{r libraries}
+library(tidyverse)
+library(corrplot)
+library(FactoMineR)
+library(factoextra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cluster)
+library(kohonen)
+library(mclust)
+library(NbClust)
+library(sf)
+library(tmap)
+
+library(maptiles)
+library(fpc)
+```
+
+# Exploratory Data Analysis
+
+Notes about the data:
+
+-   The Number of actual listings for a host is a subset of the "host listing count" column and itself a subset of "total host listing count"
+-   Wards are geographical divisions for electoral purposes. Neighborhood is like areas like Muizenburg. However, the data doesn't that good. A lot of just Cape Town which doesn't mean much -   Booked, Revenue, Availability (time_frame: 30, 60, ... 365)
+-   Number of reviews. ltm = 12 months
+
+Quick Data processing:
+-   Rename variables
+-   Discard id, picture url, host id (can be inferred from host name)
+-   Make categorical variables factors
+
+```{r dataLoading}
+load("airbnbListings.RData")
+# str(Airbnb_Excel_Lab_AAMB_Co)
+head(Airbnb_Excel_Lab_AAMB_Co)
+
+airbnb_data <- Airbnb_Excel_Lab_AAMB_Co %>%
+  rename(
+    Host_Name     = `Host_Name_Trimmed & Proper`,
+    Neighbourhood = `Neighbourhood_Proper & Trim`,
+    Wards         = `Neighbourhood_Cleansed`,
+    Property_Type = `Property_Type_Proper & Trim`,
+    Room_Type     = `Room_Type_Proper & Trim`
+  ) %>%
+  select(-ID, -Picture_URL, -Host_ID) %>%
+  mutate(
+    across(c(
+      Room_Type,
+      Property_Type,
+      Neighbourhood,
+      Wards
+    ), as.factor),
+  )
+
+head(airbnb_data)
+# str(airbnb_data) # you can check same info in environment panel
+# summary(airbnb_data)
+```
+
+## NA values and Data Imputation
+
+NA variables:
+
+-   Neighborhood has most NA values. We can impute common neighborhood in assigned ward.
+-   Bedrooms, Beds, Bathrooms. We can impute with Median
+-   Review_Score: Accuracy, Cleanliness, Checkin, Communication, Location, Value. We can impute with Median
+
+<!-- Potential ideas: -->
+<!-- -   Have a occupancy variable (booked/30) -->
+<!-- -   Take the log of price -->
+
+```{r naData}
+# check of NA values
+airbnb_data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+```
+
+
+
+```{r dataImputation}
+# beds, bathroom, bedroom ward level imputation
+airbnb_data <- airbnb_data %>%
+  group_by(Wards) %>%
+  mutate(across(
+    c(Bedrooms, Beds, Bathrooms),
+    ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)
+  )) %>%
+  ungroup() # Always ungroup!
+
+# Replace any remaining NAs with global median.
+airbnb_data <- airbnb_data %>%
+  mutate(across(
+    c(Bedrooms, Beds, Bathrooms),
+    ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)
+  ))
+
+
+# Review: Ward level imputation
+airbnb_data <- airbnb_data %>%
+  group_by(Wards) %>%
+  mutate(across(
+    starts_with("Review_Scores"),
+    ~ ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x)
+  )) %>%
+  ungroup()
+
+# Replace any remaining NAs with global median.
+airbnb_data <- airbnb_data %>%
+  mutate(across(
+    starts_with("Review_Scores"),
+    ~ ifelse(is.nan(.x) | is.na(.x), mean(.x, na.rm = TRUE), .x)
+  ))
+
+```
+
+```{r}
+colSums(is.na(airbnb_data))
+```
+
+
+## Outliears and Anomolies
+
+-   Neighborhood has many generic labels and has redundant information captured by wards. Dropping the column seems to be a good idea
+-   Price seems to have a heavy tail expensive prices.
+- Looking at overlap table of property type and room type. Property type is just a fine grained representation of Room Type.
+- Outliers in Bathrooms, Bedrooms with 50?? Beds with 70??
+- Availability is directly -1 correlation to booking. Hence, dropping this seems to be also a good idea.
+
+
+
+```{r}
+neighbourhood_table <- as.data.frame(table(airbnb_data$Neighbourhood)) %>% arrange(desc(Freq))
+neighbourhood_table
+
+ward_table <- as.data.frame(table(airbnb_data$Wards)) %>% arrange(desc(Freq))
+ward_table
+
+```
+
+
+```{r}
+airbnb_data %>% count(Room_Type, sort = TRUE)
+airbnb_data %>% count(Property_Type, sort = TRUE)
+
+room_property_table <- table(airbnb_data$Room_Type, airbnb_data$Property_Type)
+
+# View the table
+print(room_property_table)
+```
+
+
+```{r}
+host_vars <- c("Host_Listings_Count", "Host_Total_Listings_Count")
+physical_vars <- c("Accommodates", "Bathrooms", "Bedrooms", "Beds")
+pricing_vars <- c("Price")
+financial_vars <- c("Revenue_30", "Revenue_60", "Revenue_90", "Revenue_365")
+booking_vars <- c("Booked_30", "Booked_60", "Booked_90", "Booked_365")
+availability_vars <- c(
+  "Availability_30",
+  "Availability_60",
+  "Availability_90",
+  "Availability_365"
+)
+review_count_vars <- c(
+  "Number_of_reviews",
+  "Number_of_Reviews_ltm",
+  "Number_of_Reviews_l30d",
+  "Reviews_per_Month"
+)
+review_score_vars <- c(
+  "Review_Scores_Rating",
+  "Review_Scores_Accuracy",
+  "Review_Scores_Cleanliness",
+  "Review_Scores_Checkin",
+  "Review_Scores_Communication",
+  "Review_Scores_Value"
+)
+
+plot_hist_group <- function(data, var_list, title, fill_color = "steelblue", bins = 30) {
+  data %>%
+    select(all_of(var_list)) %>%
+    pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+    ggplot(aes(x = value)) +
+    geom_histogram(bins = bins, fill = fill_color, color = "white") +
+    facet_wrap(~variable, scales = "free") +
+    theme_minimal() +
+    labs(title = title, x = "Value", y = "Frequency")
+}
+
+# Host Activity
+plot_hist_group(airbnb_data, host_vars, "Host Listings Distribution", "darkblue")
+
+# Physical Attributes
+plot_hist_group(airbnb_data, physical_vars, "Space and Capacity Distribution", "forestgreen", bins = 15)
+
+
+# Price
+plot_hist_group(airbnb_data, c("Price"), "Price Distribution", "steelblue", bins=60)
+
+# Revenue
+plot_hist_group(airbnb_data, financial_vars, "Estimated Revenue Distributions", "indianred")
+
+
+# Bookings
+plot_hist_group(airbnb_data, booking_vars, "Booking Counts (Demand)", "purple")
+
+# Availability
+plot_hist_group(airbnb_data, availability_vars, "Listing Availability (Supply)", "darkorchid")
+
+# Review Engagement
+plot_hist_group(airbnb_data, review_count_vars, "Review Frequency and Engagement", "darkslategrey")
+
+# Review Scores
+plot_hist_group(airbnb_data, review_score_vars, "Detailed Review Scores", "gold", bins = 20)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+df_subset <- get_data_subset()
+
+
+p_bath <- ggplot(df_subset, aes(x = factor(Bathrooms))) +
+  geom_bar(fill = "forestgreen", color = "white", width = 0.9) +
+  theme_minimal() +
+  labs(title = "Bathrooms", x = NULL, y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_bed <- ggplot(df_subset, aes(x = factor(Bedrooms))) +
+  geom_bar(fill = "forestgreen", color = "white", width = 0.9) +
+  theme_minimal() +
+  labs(title = "Bedrooms", x = NULL, y = NULL) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_beds <- ggplot(df_subset, aes(x = factor(Beds))) +
+  geom_bar(fill = "forestgreen", color = "white", width = 0.9) +
+  theme_minimal() +
+  labs(title = "Beds", x = "Units", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_price <- ggplot(df_subset, aes(x = Log_Price)) +
+  geom_histogram(bins = 30, fill = "forestgreen", color = "white") +
+  theme_minimal() +
+  labs(title = "Log_Price", x = "Units", y = NULL) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_transformed <- (p_bath + p_bed) / (p_beds + p_price)
+
+
+p_bath_untrans <- ggplot(airbnb_data, aes(x = Bathrooms)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(title = "Bathrooms", x = NULL, y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_bed_untrans <- ggplot(airbnb_data, aes(x = Bedrooms)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(title = "Bedrooms", x = NULL, y = NULL) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_beds_untrans <- ggplot(airbnb_data, aes(x = Beds)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(title = "Beds", x = "Units", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_price_untrans <- ggplot(airbnb_data, aes(x = Price)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(title = "Price", x = "Units", y = NULL) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_untransformed <- (p_bath_untrans + p_bed_untrans) / (p_beds_untrans + p_price_untrans)
+
+plot_untransformed | plot_transformed
+```
+
+
+```{r}
+# check the outliers for beds, bedrooms, and bathrooms
+airbnb_data %>%
+  select(Bedrooms, Bathrooms, Beds) %>%
+  # Remove NAs to avoid plot errors
+  drop_na() %>%
+  pivot_longer(cols = everything(),
+               names_to = "Feature",
+               values_to = "Count") %>%
+  ggplot(aes(x = Feature, y = Count, fill = Feature)) +
+  # Create the box plot
+  geom_boxplot(outlier.color = "red", outlier.shape = 1, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Box Plot of Physical Capacity Features",
+       subtitle = "Full dataset (N = 16,319)",
+       x = "Variable",
+       y = "Count") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme(legend.position = "none")
+```
+
+
+## Correlation
+
+```{r correlation}
+
+cor_all <- airbnb_data %>%
+  select(where(is.numeric)) %>%
+  select(
+    -Host_Listings_Count,
+    -Host_Total_Listings_Count,
+    -Latitude,
+    -Longitude,
+    -starts_with("Booked"),
+    -starts_with("Availability"),
+    -starts_with("Revenue")
+   ) %>%
+  cor(use = "complete.obs")
+
+
+corrplot(cor_all,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.45,    
+         tl.pos = "l",
+         tl.col = "black",
+         addCoef.col = "black",
+         number.cex = 0.35,    
+         mar = c(0, 0, 1, 0)
+         # title = "Correlation Matrix of Numeric Features"
+         )
+
+
+cor_booking_avail <- airbnb_data %>%
+  select(starts_with("Booked"), starts_with("Availability")) %>%
+  cor(use = "complete.obs")
+
+corrplot(cor_booking_avail,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.45,        
+         # tl.pos = "l",
+         tl.col = "black",
+         addCoef.col = "black",
+         number.cex = 0.35,     
+         mar = c(0, 0, 1, 0),
+         title = "Correlation Matrix")
+
+cor_reviews <- airbnb_data %>%
+  select(contains("review")) %>%
+  cor(use = "complete.obs")
+
+corrplot(cor_reviews,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.45,         
+         # tl.pos = "l",
+         tl.col = "black",
+         addCoef.col = "black",
+         number.cex = 0.35,     
+         mar = c(0, 0, 1, 0),
+         title = "Correlation Matrix")
+
+
+cor_all_minus_review <- airbnb_data %>%
+  select(where(is.numeric)) %>%
+  select(
+    # -Host_Listings_Count,
+    # -Host_Total_Listings_Count,
+    -Latitude,
+    -Longitude,
+    # -starts_with("Booked"),
+    -starts_with("Availability"),
+    -contains("review")
+   ) %>%
+  cor(use = "complete.obs")
+
+
+corrplot(cor_all_minus_review,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.45,      
+         # tl.pos = "l",
+         tl.col = "black",
+         addCoef.col = "black",
+         number.cex = 0.35,     
+         mar = c(0, 0, 1, 0),
+         title = "Correlation Matrix")
+
+```
+
+## PCA
+
+We split PCA into two groups from findings from the before correlation matrix
+-   Review variables. We seem to get 2 PCA.
+-   Everything. We seem to get 4 PCA
+
+Other PCA:
+-   Price and related things with price (bathroom, size,..). Financial indicators
+-   Availability. Short term indicators
+-   House features. Physical capacity
+-   Year metrics of booking and revenue. Long term indicators
+
+Reviews PCA:
+-   Number of reviews. Review Traffic
+-   Review Scores. Guest Satisfaction
+
+```{r}
+pca_prep <- airbnb_data %>%
+  select(where(is.numeric)) %>%
+  select(
+    -Host_Listings_Count,
+    -Host_Total_Listings_Count,
+    -Latitude,
+    -Latitude,
+    -Longitude,
+    -starts_with("Availability"),
+    # -Price
+    # starts_with("Booked"),
+    # -contains("review")
+   ) %>%
+  select(contains("review"), Accommodates, Bathrooms, Bedrooms, Beds)
+
+
+pca_group <- PCA(pca_prep %>% select(-contains("review")), scale.unit = TRUE)
+pca_review  <- PCA(pca_prep %>% select(contains("review")), scale.unit = TRUE)
+
+fviz_eig(pca_group, addlabels = TRUE, ylim = c(0, 50))
+fviz_eig(pca_review, addlabels = TRUE, ylim = c(0, 50))
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(FactoMineR) 
+library(factoextra) 
+
+pca_prep <- airbnb_data %>%
+  select(where(is.numeric)) %>%
+  select(
+    -Host_Listings_Count,
+    -Host_Total_Listings_Count,
+    -Latitude,
+    -Longitude,
+    -starts_with("Availability")
+  ) %>%
+  select(contains("review"), Accommodates, Bathrooms, Bedrooms, Beds) %>%
+  mutate(
+    # Log_Price = log(Price),
+    # Cap Bedrooms at 5, Bathrooms at 4, Beds at 6, Accommodates at 10
+    Bedrooms = pmin(Bedrooms, 5),
+    Bathrooms = pmin(Bathrooms,4),
+    Beds = pmin(Beds, 6),
+    Accommodates = pmin(Accommodates, 10)
+  )
+
+pca_group  <- PCA(pca_prep %>% select(-contains("review")), scale.unit = TRUE, graph = FALSE)
+pca_review <- PCA(pca_prep %>% select(contains("review")), scale.unit = TRUE, graph = FALSE)
+
+
+plot_group <- fviz_eig(pca_group, addlabels = TRUE) +
+  labs(title = "Scree Plot: Physical Features") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_review <- fviz_eig(pca_review, addlabels = TRUE) +
+  labs(title = "Scree Plot: Review Scores") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+physical_group <- fviz_contrib(pca_group, choice = "var", axes = 1, top = 10, title = "Physical Capacity PC1 Contributions")
+
+review_pca1 <- fviz_contrib(pca_review, choice = "var", axes = 1, top = 10, title = "Review PC1 Contributions")
+review_pca2 <- fviz_contrib(pca_review, choice = "var", axes = 2, top = 10, title = "Review PC2 Contributions")
+
+(plot_group | plot_review) / (review_pca1 + review_pca2)
+```
+
+
+
+```{r}
+# PCA Plot 1
+fviz_contrib(pca_group, choice = "var", axes = 1, top = 10, title = "Group PC1 Contributions")
+fviz_contrib(pca_group, choice = "var", axes = 2, top = 10, title = "Group PC2 Contributions")
+fviz_contrib(pca_group, choice = "var", axes = 3, top = 10, title = "Group PC3 Contributions")
+fviz_contrib(pca_group, choice = "var", axes = 4, top = 10, title = "Group PC4 Contributions")
+
+# PCA Plot 2
+fviz_contrib(pca_review, choice = "var", axes = 1, top = 10, title = "Review PC1 Contributions")
+fviz_contrib(pca_review, choice = "var", axes = 2, top = 10, title = "Review PC2 Contributions")
+```
+
+## Putting it all together
+
+```{r}
+
+# # Replace numerical variables with both PCA analyses
+pca_features <- data.frame(
+  Physical_Capacity   = pca_group$ind$coord[, 1],
+  Review_Quality      = pca_review$ind$coord[, 1],
+  Review_Volume       = pca_review$ind$coord[, 2]
+)
+
+
+# ward averages
+ward_averages <- airbnb_data %>%
+  group_by(Wards) %>%
+  mutate(
+    Log_Price = log(Price),
+  ) %>%
+  summarise(
+    Avg_Price     = mean(Log_Price, na.rm = TRUE),
+    Avg_Latitude  = mean(Latitude, na.rm = TRUE),
+    Avg_Longitude = mean(Longitude, na.rm = TRUE),
+    # Listing_Count = n()
+  ) %>%
+  ungroup()
+
+print(ward_averages)
+```
+
+
+```{r}
+# makes price to be log
+# add pca features
+# add ward level averages
+get_data_subset <- function() {
+  data <- airbnb_data %>%
+  mutate(
+    Log_Price = log(Price),
+  ) %>%
+  select(Wards, Log_Price, Room_Type) %>%
+  bind_cols(pca_features) %>%
+  left_join(ward_averages, by = "Wards") %>%
+  select(-Wards)
+}
+
+temp_df <- get_data_subset()
+head(temp_df)
+
+```
+
+## Choosing K
+```{r date_prep}
+
+set.seed(123)
+nstart <- 25
+
+data <- get_data_subset()
+data_num <- data %>%
+  select(Log_Price, Physical_Capacity, Review_Quality, Review_Volume ) %>%
+  as.matrix() %>%
+  scale()
+
+# data_cat <- model.matrix(~ Room_Type - 1, data = data)
+
+# data <-cbind(data_num, data_cat)
+data <- data_num
+```
+
+
+```{r choosing_k_wss, cache=TRUE}
+fviz_nbclust(data, kmeans, method = "wss", k.max = 10) +
+  labs(title = "Elbow Method (WSS) for K-means")
+```
+
+```{r choosing_k_sil}
+fviz_nbclust(data, kmeans, method = "silhouette", k.max = 10) +
+  labs(title = "Average Silhouette Width for K-means")
+```
+
+```{r choosing_k_gap}
+set.seed(123)
+# gap_stat <- clusGap(data, FUNcluster = kmeans, K.max = 10, B = 25, nstart = nstart)
+save(gap_stat, file="gap_stat.RData")
+load("gap_stat.RData")
+plot(gap_stat, main = "Gap Statistic for K-means")
+```
+
+
+```{r choosing_k_nbclust}
+
+set.seed(123)
+# res.nb <- NbClust(nhc_data, distance = "euclidean",
+#                   min.nc = 2, max.nc = 10,
+#                   method = "kmeans", index = "all")
+# save(res.nb, file = "nbclustResults.RData")
+load("nbclustResults.RData")
+table(res.nb$Best.nc["Number_clusters", ])
+cat("Majority vote K:",
+    as.integer(names(which.max(table(res.nb$Best.nc["Number_clusters", ])))), "\n")
+fviz_nbclust(res.nb)
+
+ k_vals <- as.numeric(rownames(res.nb$All.index))
+valid_indices <- intersect(colnames(res.nb$All.index), colnames(res.nb$Best.nc))
+  for (idx in valid_indices)  {
+    best_k <- res.nb$Best.nc["Number_clusters", idx]
+    plot(k_vals, res.nb$All.index[, idx], type = "b",
+         xlab = "Number of clusters k", ylab = "Index value",
+         main = paste("Index:", idx))
+    if (!is.na(best_k) && best_k > 0)
+      abline(v = best_k, lty = 2, col = "red")
+  }
+```
+
+## Cluster profilling helpers
+
+```{r cluster-profiling-helpers}
+profile_vars <- get_data_subset()
+
+cluster_num_vars <- c("Log_Price", "Physical_Capacity", "Review_Quality", "Review_Volume")
+
+summarise_profile <- function(cluster_vec) {
+    profile_vars %>%
+      mutate(cluster = factor(cluster_vec)) %>%
+      group_by(cluster) %>%
+      summarise(
+        n                      = n(),
+        mean_log_price         = round(mean(Log_Price,         na.rm = TRUE), 3),
+        mean_physical_capacity = round(mean(Physical_Capacity, na.rm = TRUE), 3),
+        mean_review_quality    = round(mean(Review_Quality,    na.rm = TRUE), 3),
+        mean_review_volume     = round(mean(Review_Volume,     na.rm = TRUE), 3),
+        dominant_room_type     = names(which.max(table(Room_Type)))
+      )
+  }
+
+  plot_profile <- function(cluster_vec, title) {
+    k   <- length(unique(cluster_vec))
+    mat <- profile_vars %>%
+    select(all_of(cluster_num_vars)) %>%
+    scale() %>%
+    as.data.frame() %>%
+    mutate(cluster = cluster_vec) %>%
+    group_by(cluster) %>%
+    summarise(across(everything(), mean)) %>%
+    select(-cluster) %>%
+    as.matrix()
+
+    as.data.frame(mat) %>%
+    mutate(cluster = factor(1:k)) %>%
+    pivot_longer(-cluster, names_to = "variable", values_to = "mean") %>%
+    mutate(variable = factor(variable, levels = cluster_num_vars)) %>%
+    ggplot(aes(x = variable, y = mean, colour = cluster, group = cluster)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_line(linewidth = 1.2) +
+    geom_point(size = 3) +
+    scale_colour_brewer(palette = "Set1", name = "Cluster") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+    labs(title = title, x = NULL, y = "Standardised Mean")
+}
+
+```
+
+
+
+
+
+## Hierarchical Clustering
+
+```{r}
+
+set.seed(123)
+data <- get_data_subset()
+data_num <- data %>%
+  select(Log_Price, Physical_Capacity, Review_Quality, Review_Volume ) %>%
+  as.matrix() %>%
+  scale()
+data <- data_num
+
+hierarchical_clustering <- hclust(
+  daisy(data,metric="gower"),
+  method="complete"
+)
+
+plot(hierarchical_clustering, labels = F,-1)
+rect.hclust(hierarchical_clustering, k =4, border = 2:11)
+```
+
+```{r}
+hierarchical_clustering_cut <- cutree(hierarchical_clustering, k=4)
+ # view cluster allocation
+# names(hierarchical_clustering_cut) <- rownames(data)
+# sort(hierarchical_clustering_cut)
+
+
+data_clustered <- as.data.frame(data) %>%
+  mutate(Cluster = as.factor(hierarchical_clustering_cut))
+```
+
+#proffiling
+
+```{r hc_profile_plot}
+print(summarise_profile(hierarchical_clustering_cut))
+plot_profile(hierarchical_clustering_cut, "Hierarchical Clustering Profiles (k = 4)")
+```
+
+```{r}
+# cluster_summary <- data_clustered %>%
+#   group_by(Cluster) %>%
+#   summarise(
+#     Listings_Count = n(),
+#     Avg_Log_Price = mean(Log_Price),
+#     Avg_Accommodates = mean(Accommodates),
+#     Avg_Bedrooms = mean(Bedrooms),
+#     Avg_Bathrooms = mean(Bathrooms),
+#     # Find the most frequent Room_Type in this cluster
+#     Dominant_Room_Type = names(which.max(table(Room_Type)))
+#   ) %>%
+#   arrange(desc(Listings_Count))
+#
+# # View the summary table
+# print(cluster_summary)
+```
+
+```{r}
+# Boxplot for Price by Cluster
+ggplot(data_clustered, aes(x = Cluster, y = Log_Price, fill = Cluster)) +
+  geom_boxplot(show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = "Distribution of Price across Clusters",
+       x = "Cluster ID", y = "Log Price")
+
+# Boxplot for Accommodates by Cluster
+ggplot(data_clustered, aes(x = Cluster, y = Accommodates, fill = Cluster)) +
+  geom_boxplot(show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = "Listing Capacity (Accommodates) across Clusters",
+       x = "Cluster ID", y = "Guests Accommodated")
+```
+
+```{r}
+ggplot(data_clustered, aes(x = Cluster, fill = Room_Type)) +
+  geom_bar(position = "fill") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Room Type Breakdown per Cluster",
+       x = "Cluster ID", y = "Percentage of Listings", fill = "Room Type")
+```
+
+
+
+```{r hc_validation}
+hc_dist <- daisy(get_data_subset(), metric = "gower")
+sil_hc  <- silhouette(hierarchical_clustering_cut, hc_dist)
+
+cat("HC mean silhouette:", round(mean(sil_hc[, 3]), 3), "\n")
+
+fviz_silhouette(sil_hc) +
+  labs(title = "Silhouette Plot — Hierarchical Clustering (k = 3)")
+```
+
+## Stability: Bootstrapped ARI
+
+```{r hc_ari}
+hc_data <- data
+n_hc    <- nrow(hc_data)
+B       <- 100
+ari_hc_vals <- numeric(B)
+
+set.seed(123)
+for (b in 1:B) {
+  idx       <- sample(1:n_hc, size = n_hc, replace = TRUE)
+  hc_boot   <- hclust(daisy(hc_data[idx, ], metric = "gower"), method = "complete")
+  hc_boot_cut <- cutree(hc_boot, k = 10)
+  ari_hc_vals[b] <- adjustedRandIndex(hierarchical_clustering_cut[idx], hc_boot_cut)
+}
+
+cat("Mean ARI:", round(mean(ari_hc_vals), 3), "\n")
+cat("SD ARI:  ", round(sd(ari_hc_vals), 3), "\n")
+hist(ari_hc_vals, main = "Bootstrap ARI Distribution (HC)",
+     xlab = "ARI", col = "steelblue", breaks = 20)
+```
+
+## Stability: Jaccard (clusterboot)
+
+```{r hc_jaccard}
+hc_dist_mat <- as.matrix(daisy(data, metric = "gower"))
+
+set.seed(123)
+clboot_hc <- clusterboot(
+  hc_dist_mat,
+  B = 25,
+  clustermethod = hclustCBI,
+  method = "complete",
+  k = 4,
+  dissimilarity = TRUE,
+  seed = 123
+)
+
+cat("Mean Jaccard stability per cluster:\n")
+print(round(clboot_hc$bootmean, 3))
+```
+
+
+```{r}
+
+airbnb_map <- airbnb_data %>%
+  mutate(
+    hierarchical    = factor(hierarchical_clustering_cut),
+  ) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+tmap_mode("plot")
+
+
+tm_shape(airbnb_map) +
+  tm_dots(fill = "hierarchical", size = 0.5) +
+  tm_layout(title = paste0("Hierarchical Clusters (K = ", 4, ")"))
+
+tiles <- get_tiles(airbnb_map, provider = "OpenStreetMap", zoom = 12)
+
+# hierachical
+tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "hierarchical", size = 0.5) +
+  tm_layout(title = paste0("Hierarchical Clusters (K = ", 4, ")"))
+
+```
+
+
+# Non-Hierarchical Clustering
+
+## Data Preparation
+
+```{r nhc_setup}
+set.seed(123)
+nstart <- 25
+
+data <- get_data_subset()
+data_num <- data %>%
+  select(Log_Price, Physical_Capacity, Review_Quality, Review_Volume ) %>%
+  as.matrix() %>%
+  scale()
+
+# data_cat <- model.matrix(~ Room_Type - 1, data = data)
+
+# data <-cbind(data_num, data_cat)
+nhc_data <- data_num
+
+```
+
+
+## Fitting: K-means and CLARA
+
+```{r nhc_fit}
+K <- 4
+
+set.seed(123)
+km_final   <- kmeans(nhc_data, centers = K, nstart = nstart)
+clara_out  <- clara(nhc_data, k = K, samples = 25, pamLike = TRUE)
+
+fviz_cluster(km_final, data = nhc_data, geom = "point",
+             ellipse.type = "convex") +
+  labs(title = paste0("K-means Clustering (K = ", K, ")"))
+
+fviz_cluster(clara_out, data = nhc_data, geom = "point",
+             ellipse.type = "convex") +
+  labs(title = paste0("CLARA Clustering (K = ", K, ")"))
+```
+
+## Cluster Profiling
+
+```{r nhc_profiling}
+print(summarise_profile(km_final$cluster))
+print(summarise_profile(clara_out$clustering))
+```
+
+```{r nhc_profile_plot}
+plot_profile(km_final$cluster,   "K-means Cluster Profiles")
+plot_profile(clara_out$clustering, "CLARA Cluster Profiles")
+```
+
+
+## Comparison and Validation
+
+```{r nhc_compare}
+
+
+# Agreement between the two methods
+ari_km_clara <- adjustedRandIndex(km_final$cluster, clara_out$clustering)
+cat("ARI (K-means vs CLARA):", round(ari_km_clara, 3), "\n")
+
+# Silhouette for each method
+sil_km    <- silhouette(km_final$cluster,    dist(nhc_data))
+sil_clara <- silhouette(clara_out$clustering, dist(nhc_data))
+
+cat("K-means mean silhouette:", round(mean(sil_km[, 3]), 3), "\n")
+cat("CLARA   mean silhouette:", round(mean(sil_clara[, 3]), 3), "\n")
+
+
+```
+
+## Stability: Bootstrapped ARI
+
+```{r nhc_ari}
+
+B        <- 100
+n        <- nrow(nhc_data)
+ari_vals <- numeric(B)
+
+set.seed(123)
+for (b in 1:B) {
+  idx         <- sample(1:n, size = n, replace = TRUE)
+  km_boot     <- kmeans(nhc_data[idx, ], centers = K, nstart = nstart)
+  ari_vals[b] <- adjustedRandIndex(km_final$cluster[idx], km_boot$cluster)
+}
+
+cat("Mean ARI:", round(mean(ari_vals), 3), "\n")
+cat("SD ARI:  ", round(sd(ari_vals), 3), "\n")
+hist(ari_vals, main = "Bootstrap ARI Distribution (K-means)",
+     xlab = "ARI", col = "steelblue", breaks = 20)
+```
+
+## Stability: Jaccard (clusterboot)
+
+```{r nhc_jaccard}
+set.seed(123)
+clboot_out <- clusterboot(
+  nhc_data,
+  B = 100,
+  clustermethod = kmeansCBI,
+  krange = K,
+  seed = 123
+)
+
+cat("Mean Jaccard stability per cluster:\n")
+print(round(clboot_out$bootmean, 3))
+```
+
+```{r map_plot}
+# plotting maps
+airbnb_map <- airbnb_data %>%
+  mutate(
+    km_cluster    = factor(km_final$cluster),
+    clara_cluster = factor(clara_out$clustering)
+  ) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+tmap_mode("plot")
+# K-means map
+tm_shape(airbnb_map) +
+  tm_dots(fill = "km_cluster", size = 0.5) +
+  tm_layout(title = paste0("K-means Clusters (K = ", K, ")"))
+
+# CLARA map
+tm_shape(airbnb_map) +
+  tm_dots(fill = "clara_cluster", size = 0.5) +
+  tm_layout(title = paste0("CLARA Clusters (K = ", K, ")"))
+
+tiles <- get_tiles(airbnb_map, provider = "OpenStreetMap", zoom = 12)
+
+# K-means
+tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "km_cluster", size = 0.5) +
+  tm_layout(title = paste0("K-means Clusters (K = ", K, ")"))
+
+# CLARA
+tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "clara_cluster", size = 0.5) +
+  tm_layout(title = paste0("CLARA Clusters (K = ", K, ")"))
+
+
+map_kmeans <- tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "km_cluster", size = 0.5) +
+  tm_layout(title = paste0("K-means Clusters (K = ", K, ")"), 
+            legend.outside = TRUE)
+
+map_clara <- tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "clara_cluster", size = 0.5) +
+  tm_layout(title = paste0("CLARA Clusters (K = ", K, ")"), 
+            legend.outside = TRUE)
+
+tmap_arrange(map_kmeans, map_clara, ncol = 2)
+```
+
+## HC vs NHC Comparison
+
+```{r hc_nhc_compare}
+# Evaluate all three solutions on the same Euclidean distance for a fair comparison
+sil_hc <- silhouette(hierarchical_clustering_cut, dist(nhc_data))
+
+cat("Mean silhouette scores:\n")
+cat("  HC:      ", round(mean(sil_hc[, 3]), 3), "\n")
+cat("  K-means: ", round(mean(sil_km[, 3]), 3), "\n")
+cat("  CLARA:   ", round(mean(sil_clara[, 3]), 3), "\n")
+
+ari_hc_km    <- adjustedRandIndex(hierarchical_clustering_cut, km_final$cluster)
+ari_hc_clara <- adjustedRandIndex(hierarchical_clustering_cut, clara_out$clustering)
+cat("\nARI (HC vs K-means):", round(ari_hc_km, 3), "\n")
+cat("ARI (HC vs CLARA):  ", round(ari_hc_clara, 3), "\n")
+```
+
+
+```{r}
+airbnb_map <- airbnb_data %>%
+  mutate(
+    SOM    = factor(som_cluster_assignments),
+  ) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+tmap_mode("plot")
+# K-means map
+tm_shape(airbnb_map) +
+  tm_dots(fill = "SOM", size = 0.5)
+  # tm_layout(title = paste0("SOM"))
+
+
+tiles <- get_tiles(airbnb_map, provider = "OpenStreetMap", zoom = 12) #chat gave this
+
+# SOM
+tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "SOM", size = 0.5)
+  # tm_layout(title = paste0("K-means Clusters (K = ", K, ")"))
+```
+
+
+# SOM
+
+```{r}
+set.seed(123)
+data <- get_data_subset()
+
+data_num <- data %>%
+  select(Log_Price, Physical_Capacity, Review_Quality, Review_Volume
+         #, Avg_Price
+         # Avg_Latitude, Avg_Longitude
+         ) %>%
+
+  as.matrix() %>%
+  scale()
+
+data_cat <- model.matrix(~ Room_Type - 1, data = data)
+som_data <- list(measurements = data_num, room_types = data_cat)
+
+
+# SOM
+som_grid <- somgrid(xdim = 15, ydim = 15, topo = "hexagonal")
+# grid_distances <- unit.distances(som_grid)
+# start_radius <- quantile(grid_distances, 1/2)
+
+som_model <- supersom(
+  data = som_data,
+  grid = som_grid,
+  rlen = 2000,
+  whatmap = c("measurements", "room_types"),
+  user.weights = c(1, 0.1),
+  alpha= c(0.05, 0.01),
+)
+
+
+# data <- as.data.frame(X_matrix)
+# data <- data %>% select(-contains("wards"), -contains("room"), -Longitude, -Latitude)
+#
+# som_grid <- somgrid(xdim = 20, ydim=20, topo="hexagonal")
+
+# som_model <- som(data_num,grid=som_grid, rlen=1000,
+#                  alpha=c(0.05,0.01),
+#                  keep.data = TRUE  )
+```
+
+```{r}
+# 1. Split the plotting device into a 2x2 grid
+# mar adjusts margins (bottom, left, top, right) to give the subplots breathing room
+png("som_plots_combined.png", width = 1200, height = 1000, res = 120)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+
+# 2. Call your four plots sequentially
+plot(som_model, type = "changes")
+plot(som_model, type = "counts")
+plot(som_model, type = "dist.neighbours")
+plot(som_model, type = "quality")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+maxRed <- function(n, alpha = 1) {
+  colorRampPalette(c("#F7F7F7", "#B2182B"), alpha = TRUE)(n)
+}
+
+maxGreen <- function(n, alpha = 1) {
+  colorRampPalette(c("#F7F7F7", "#1A9850"), alpha = TRUE)(n)
+}
+
+maxBlue <- function(n, alpha = 1) {
+  colorRampPalette(c("#F7F7F7", "#2166AC"), alpha = TRUE)(n)
+}
+
+maxOrange <- function(n, alpha = 1) {
+  colorRampPalette(c("#F7F7F7", "orange"), alpha = TRUE)(n)
+}
+
+SomModelCodes = som_model$codes[[1]]
+# png("som_heatmaps.png", width = 1200, height = 1000, res = 120)
+par(mfrow = c(2, 2))
+
+plot(
+  som_model,
+  type = "property",
+  property = SomModelCodes[, 1],
+  main = colnames(SomModelCodes)[1],
+  palette.name = maxRed
+)
+
+plot(
+  som_model,
+  type = "property",
+  property = SomModelCodes[, 2],
+  main = colnames(SomModelCodes)[2],
+  palette.name = maxGreen
+)
+
+plot(
+  som_model,
+  type = "property",
+  property = SomModelCodes[, 3],
+  main = colnames(SomModelCodes)[3],
+  palette.name = maxBlue
+)
+
+plot(
+  som_model,
+  type = "property",
+  property = SomModelCodes[, 4],
+  main = colnames(SomModelCodes)[4],
+  palette.name = maxOrange
+)
+```
+
+
+## Clustering
+
+```{r}
+length(som_model$unit.classif)
+tail(som_model$unit.classif,15)
+table(som_model$unit.classif)
+
+data <- som_model$codes[[1]]
+data <- data %>% cbind(som_model$codes[[2]])
+
+set.seed(123)
+# find a k
+wss <- (nrow(data)-1)*sum(apply(data,2,var))
+for (i in 2:15) {
+  wss[i] <- sum(kmeans(data, centers=i)$withinss)
+}
+plot(wss)
+
+fviz_nbclust(data, kmeans, method = "wss") +
+  labs(title = "Elbow method for k-means")
+```
+
+```{r}
+# clustering on the weights of SOM
+set.seed(123)
+K <- 4
+som_cluster <- kmeans(data, centers=K)$cluster
+som_cluster_assignments <- som_cluster[som_model$unit.classif]
+# plotting som clusters
+# plot(som_model,palette.name = rainbow)
+# add.cluster.boundaries(som_model, som_cluster)
+
+
+cluster_cols <- c("grey", "#2166AC", "orange","yellow", "blue", "indianred")
+par(mfrow = c(1, 2))
+plot(som_model,palette.name = rainbow, bgcol = cluster_cols[som_cluster])
+# add.cluster.boundaries(som_model, som_cluster)
+```
+
+## Profiling
+
+
+```{r}
+# Tabular Summary Profile
+print(summarise_profile(som_cluster_assignments))
+
+# Parallel Coordinate Line Plot Profile
+plot_profile(som_cluster_assignments, "SOM Meta-Cluster Profiles")
+```
+
+## External Analysis
+
+```{r}
+# Silhouette for the SOM clustering
+# We use 'data_num' here because it represents the scaled numeric matrix used by the SOM
+sil_som <- silhouette(som_cluster_assignments, dist(data_num))
+cat("SOM mean silhouette:", round(mean(sil_som[, 3]), 3), "\n")
+```
+
+## Cluster Stability
+
+```{r}
+B <- 50
+n <- nrow(data_num)
+som_ari_vals <- numeric(B)
+
+set.seed(123)
+for (b in 1:B) {
+  idx <- sample(1:n, size = n, replace = TRUE)
+
+  boot_data <- list(
+    measurements = data_num[idx, ],
+    room_types   = data_cat[idx, ]
+  )
+
+  som_boot <- supersom(
+    data = boot_data,
+    grid = som_grid,
+    rlen = 1000,
+    whatmap = c("measurements", "room_types"),
+    user.weights = c(1, 0.1),
+    alpha = c(0.05, 0.01)
+  )
+  boot_codes <- cbind(som_boot$codes$measurements, som_boot$codes$room_types)
+  K <- 3
+  boot_node_clusters <- kmeans(boot_codes, centers = K, nstart = 25)$cluster
+  boot_assignments <- boot_node_clusters[som_boot$unit.classif]
+
+
+  som_ari_vals[b] <- adjustedRandIndex(som_cluster_assignments[idx], boot_assignments)
+}
+
+cat("SOM Mean Bootstrap ARI:", round(mean(som_ari_vals), 3), "\n")
+cat("SOM SD Bootstrap ARI:  ", round(sd(som_ari_vals), 3), "\n")
+
+hist(som_ari_vals, main = "Bootstrap ARI Distribution (SOM)",
+     xlab = "ARI", col = "darkorange", breaks = 15)
+```
+
+```{r}
+airbnb_map <- airbnb_data %>%
+  mutate(
+    SOM    = factor(som_cluster_assignments),
+  ) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+tmap_mode("plot")
+# K-means map
+tm_shape(airbnb_map) +
+  tm_dots(fill = "SOM", size = 0.5)
+  # tm_layout(title = paste0("SOM"))
+
+
+tiles <- get_tiles(airbnb_map, provider = "OpenStreetMap", zoom = 12) #chat gave this
+
+# SOM
+tm_shape(tiles) +
+  tm_rgb() +
+  tm_shape(airbnb_map) +
+  tm_dots(fill = "SOM", size = 0.5)
+  # tm_layout(title = paste0("K-means Clusters (K = ", K, ")"))
+
+```
+
