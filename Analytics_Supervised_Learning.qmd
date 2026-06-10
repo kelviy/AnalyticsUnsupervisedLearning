@@ -1,0 +1,1259 @@
+---
+title: ""
+subtitle: ""
+author: ""
+date: last-modified
+date-format: ""
+format:
+  pdf:
+    fig-pos: "H"
+    toc: false
+    number-sections: true
+    colorlinks: true
+    geometry:
+      - top=25mm
+      - bottom=25mm
+      - left=25mm
+      - right=25mm
+    highlight-style: pygments
+    fontfamily: libertinus
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{=latex}
+\begin{titlepage}
+\centering
+
+{\Large \textbf{UNIVERSITY OF CAPE TOWN}}\\[0.3cm]
+{\large Department of Statistical Sciences}\\[1cm]
+
+\rule{\textwidth}{0.4pt}
+
+\vspace{0.5cm}
+
+{\LARGE \textbf{Honours Analytics}}\\[0.3cm]
+{\Large Assignment 1}
+
+\vspace{0.8cm}
+
+\rule{\textwidth}{0.4pt}
+
+\vspace{1.5cm}
+
+\includegraphics[width=0.45\textwidth]{UCT_logo.png}
+
+\vspace{1cm}
+
+{\Large \textbf{Unnati Shankar}}\\
+{\Large \textbf{Kelvin Wei}}\\[0.8cm]
+
+{\large \textbf{Date:} 23 March 2026}
+
+\vfill
+\end{titlepage}
+
+\clearpage
+```
+```{=latex}
+\clearpage
+\tableofcontents
+```
+```{r}
+#| include: false
+rm(list = ls())
+library(kableExtra)
+library(caret)
+library(glmnetUtils)
+library(tidyverse)
+library(doParallel) 
+library(pROC)
+library(ranger)
+library(xgboost)
+library(lightgbm)
+library(gbm)
+library(vip)
+library(ggplot2)
+library(knitr)
+library(patchwork)
+library(pdp)
+library(gridExtra)
+```
+
+```{r}
+#| include: false
+
+# Loads the models instead of training them again
+RUN_MODELS = F
+
+# Skips the explore data graphs and tables if it is false
+EXPLORE_DATA = F
+```
+
+```{r}
+#| include: false
+
+# load airbnb data
+airbnb_data <- as_tibble(read.csv("listings.csv"))
+airbnb_desc <- as_tibble(read.csv("variable_descriptions.csv"))
+
+# check for na
+cat("Number of NA: ")
+cat(sum(is.na(airbnb_data)))
+
+# clean up data
+# Max date found was 2025-09-12 and we round to end of year
+tenure_reference_data <- as.Date("2025-12-31")  
+
+# 1. drop id's
+# 2. convert host_since to host_tenure_days
+# 3. convert to categories to factors
+airbnb_data <- airbnb_data |>
+  select(-id, -host_id) |>                                          
+  mutate(
+    host_since = as.Date(host_since),
+    host_tenure_days = as.numeric(tenure_reference_data - host_since),
+    across(where(is.character), as.factor)
+  ) |>
+  select(-host_since)
+
+# Create train and test set
+n <- nrow(airbnb_data)
+set.seed(7)
+index_mask <- sample(n, 0.8*n)
+train_set <- airbnb_data[index_mask,]
+test_set <- airbnb_data[-index_mask,]
+```
+
+```{r}
+#| include: false
+
+# exploritory data analysis
+
+if (EXPLORE_DATA) {
+  # numeric
+  train_set |>
+    select(where(is.numeric)) |>
+    summary() |>
+    as.data.frame()
+  
+  airbnb_numeric_var <- train_set |> select(where(is.numeric)) |> names()
+  
+  for (n_var in airbnb_numeric_var) {
+    hist(
+      train_set[[n_var]],
+      main = paste("Histogram of", n_var), 
+      xlab = n_var
+    )
+  }
+  
+  # categorical data
+  summary_airbnb_cat <- function(df, var_to_summary) {
+    result <- df |>
+      count({{ var_to_summary }}, sort = TRUE) |>
+      mutate(percentage = round(n / sum(n) * 100, 2))
+    return(result)
+  }
+  
+  summary_airbnb_cat(train_set, host_response_time)
+  summary_airbnb_cat(train_set, host_is_superhost)
+  summary_airbnb_cat(train_set, host_verifications)
+  summary_airbnb_cat(train_set, neighbourhood_ward)
+  summary_airbnb_cat(train_set, room_type)
+  summary_airbnb_cat(train_set, instant_bookable)
+}
+```
+
+# Introduction
+
+This report analyses Cape Town Airbnb listing data from InsideAirbnb with the goal of predicting whether a listing is high or low price. The dataset contains `r nrow(airbnb_data)` listings and `r ncol(airbnb_data)` features; these features include host characteristics (e.g. response time, acceptance rate), listing characteristics (e.g room type, price), and location information (e.g. longitude, latitude).
+
+Given the significant effects of short-term rental sites, such as Airbnb, on housing prices and long-term rental availability in Cape Town, it is imperative to understand the drivers of highly priced listings. `HighPrice` was selected as the target variable as it most directly captures housing affordability, which is the issue motivating this analysis. This binary target variable is defined as:
+
+```{=tex}
+\begin{align*}
+  \text{HighPrice} = \begin{cases} 1 & \text{if price exceeds the } 75^{th} \text{ percentile} \\ 0 & \text{otherwise} \end{cases} 
+\end{align*}
+```
+The data required minimal preprocessing: listing `id` and `host_id` were removed, and `host_since` was converted to `host_tenure_days` - defined as the number of days since the host joined relative to 31 December 2025. The data was then split into a training set (80%) and test set (20%).
+
+```{r}
+# select 75% quartile and create HighPrice variable
+q <- quantile(train_set$price, 0.75)
+price <- train_set$price
+
+train_set <- train_set |> 
+  mutate(HighPrice = factor(
+    ifelse(price > q, "Yes", "No"))
+  ) |> 
+  select(-price)
+
+test_set <- test_set |> 
+  mutate(HighPrice = factor(
+    ifelse(price > q, "Yes", "No"))
+  ) |> 
+  select(!price)
+```
+
+Using the training set, the 75th percentile of price was found to be `r round(as.numeric(q),2)` ZAR per night. The distribution for price is heavily skewed to the right, shown in @fig-price-dist. The threshold identifies the top quarter of the distributions which would most likely be too pricey for long-term renters. This also results in a manageable class imbalance for the models to handle. The models will still learn from the high price observations, but there will still be some effect on prediction which will be seen once the optimal model is fit on the test set.
+
+```{r}
+#| label: fig-price-dist
+#| fig-cap: "Distribution of Airbnb Listing Prices. The red diamond represents the mean price."
+#| fig-height: 2
+
+ggplot(train_set, aes(x = price, y = "")) +
+  stat_boxplot(geom = "errorbar", width = 0.1, color = "grey20") +
+  geom_boxplot(fill = "#619CFF", color = "grey20", 
+               outlier.size = 0.5) +
+  
+  stat_summary(fun = mean, geom = "point", shape = 18, 
+               size = 4, color = "firebrick3") +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    panel.grid.major.y = element_blank()
+  ) +
+  labs(
+    title = "Box Plot of Price Distribution",
+    x = "Price (ZAR)",
+  )
+```
+
+The same threshold of `r round(as.numeric(q),2)` ZAR was used to define `HighPrice` in the test_set, and the `price` variable was then removed from both sets.
+
+# Model Development and Selection
+
+To predict and understand the underlying behavior of `HighPrice`, multiple models of varying complexity were fit on the training set. For each model, a broad hyperparameter search space was first defined and plotted to determine if the initial search space was relatively optimal. If the search space can be seen to be improved then the model was tuned on a new range of hyperparameters.
+
+```{r}
+#| include: false
+
+# helper functions
+
+# Calculates F1 metric
+f1Summary <- function(data, lev = NULL, model = NULL) {
+  
+  # assume data has columns: obs (ground truth), pred (predicted)
+  precision <- posPredValue(data$pred, data$obs, positive = lev[2])
+  recall <- sensitivity(data$pred, data$obs, positive = lev[2])
+  
+  f1 <- ifelse(
+    precision + recall == 0,
+    0,
+    2 * precision * recall / (precision + recall)
+  )
+  
+  c(F1 = f1)
+}
+
+# Evaluate Model performance
+evaluate_model_metrics <- function(model_pred_obj, tau = 0.5, model_name = "Model") {
+  # assume model_pred_obj contains Yes - probabilities of Yes classes
+  model_pred_prob <- model_pred_obj$Yes
+  # assume model_pred_obj contains obs - original observations (ground truth labels)
+  model_obs <- model_pred_obj$obs
+  
+  model_predictions <- factor(
+      ifelse(model_pred_prob >= tau, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  
+  # confusion matrix
+  model_cm <- confusionMatrix(model_predictions, model_obs, positive = 'Yes')
+  
+  # AUROC
+  model_roc <- roc(model_obs, model_pred_prob)
+  
+  model_metrics <- data.frame(
+    Model       = model_name,
+    Accuracy    = model_cm$overall["Accuracy"],
+    F1          = model_cm$byClass["F1"],
+    Precision   = model_cm$byClass["Precision"],
+    Recall      = model_cm$byClass["Recall"],
+    Specificity = model_cm$byClass["Specificity"],
+    AUROC       = as.numeric(auc(model_roc))
+  )
+  rownames(model_metrics) <- NULL
+  
+  list(metrics = model_metrics, roc = model_roc)
+}
+
+# Controls the train function
+# threshold in Caret is 0.5 by default 
+cntrl <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = T,
+  summaryFunction = f1Summary,
+  savePredictions = "final"
+)
+
+# decision threshold
+tau = 0.5
+
+```
+
+## Regularised Elastic-net Logistic Regression
+
+Elastic-net regularisation combines L1 (Lasso) and L2 (Ridge) penalties to achieve the best of both worlds: variable selection through the Ridge penalty and dealing with highly correlated variables through the Lasso penalty.
+
+Elastic-net is controlled by two hyperparameters: `alpha`, which determines the mix between L1 and L2 penalties, and `lambda`, which determines the strength of the overall penalty. When $\alpha = 0$, the Elastic-net penalty reduces to Ridge penalty, and when $\alpha = 1$, it reduces to Lasso penalty.
+
+To find the optimal hyperparameter values, we define a search space through which we perform grid search to find the combination of $\alpha$ and $\lambda$ that yields the highest F1 Score. The search space was initially defined as $\alpha \in [0,1]$ and $\lambda \in [10^{-4}, 10^1]$. However, it was found that larger values of lambda performed worse and we refined our lambda's search space to be $\lambda \in [0, 0.1]$. The plot of the redefined hyperparameter search space is shown in @fig-en-hparm.
+
+```{r}
+# elastic-net
+
+if (RUN_MODELS) {
+  # Search space of alpha and lambda hyperparameters
+
+  # old zoomed out lambda grid 
+  # en_grid <- expand.grid(
+  #   alpha  = seq(0, 1, 0.1),
+  #   lambda = 10^seq(-4, 1, length = 30)
+  # )
+  
+  # new zoomed in lambda grid
+  en_grid <- expand.grid(
+    alpha  = seq(0, 1, 0.1),
+    lambda = seq(0, 0.1, length = 50) 
+  )
+  
+  set.seed(7)
+  
+  # Train an elasic net models
+  # Finds optimal hyperparameters via grid search
+  en_fit <- train(
+    HighPrice ~ .,
+    data = train_set,
+    method = "glmnet",
+    trControl = cntrl,
+    tuneGrid = en_grid,
+    metric = "F1",
+    preProcess = c("center", "scale"),
+    family = "binomial"
+  )
+  
+  # Saves output
+  save(en_fit, file = 'en_fit_v2.RData')
+} else {
+  # zoomed in
+  load("en_fit_v2.RData")
+}
+```
+
+The F1 Score graph for every mixing percentage ($\alpha$) is monotonically decreasing with increasing $\lambda$; this suggests that optimal values of $\lambda$ is close to or equal to 0. The optimal value of $\alpha$ is unclear from the graph at $\lambda = 0$ as they all yield in similar F1 Scores. The optimal hyperparameters were by extracted the best model and found to be: $\alpha$ = `r en_fit$bestTune$alpha`; $\lambda$ = `r en_fit$bestTune$lambda`
+
+```{r}
+#| label: fig-en-hparm
+#| fig-cap: "Plot of hyperparameter combinations for elastic net model."
+
+# Plot the graphs
+
+# zoomed out
+# load("en_fit.RData")
+
+# plot hyperparameters
+ggplot(en_fit$results, aes(x = lambda, y = F1, color = as.factor(alpha), group = alpha)) + 
+  geom_point(shape = 15, alpha = 0.6, size = 2) + 
+  geom_line() +
+  theme_minimal() +
+  # Legend settings
+  theme(
+    legend.position = "top",         
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    # Main Title
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1)) +
+  labs(
+    title = "Elastic-Net Hyper Parameter Tuning Graph",
+    x = "Regularization Parameter (Lambda)",
+    y = "F1 (Cross-Validation)",
+    color = "Mixing Percentage (Alpha)"
+  )
+```
+
+## Random Forest
+
+A Random Forest builds a collection of decision trees, each trained on a bootstrap sample of the data (training set). It accounts for the correlation between trees by considering a random set of features at each split.Random Forests are also controlled by a set of hyperparameters: `mtry` (number of features considered at each split), `splitrule` (the criterion used to evaluate the splits), and `min.node.size` (the minimum number of observations in a terminal node).
+
+```{r}
+# random forest
+  
+if (RUN_MODELS) {
+  
+  # old serach space for hyperparameters
+  # rf_grid <- expand.grid(
+  #   mtry = c(2,4,6,8,10),
+  #   splitrule = c("gini", "extratrees"),
+  #   min.node.size =  c(2,4,6,8,10)
+  # )
+  
+  # new search space for hyperparameters. Testing higher values
+  rf_grid <- expand.grid(
+    mtry = c(5, 10, 15, 20, 25),
+    splitrule = c("gini", "extratrees"),
+    min.node.size = c(1, 5, 10)
+  )
+  
+  set.seed(7)
+  
+  # Train an Random Forest model
+  # Finds optimal hyperparameters via grid search
+  rf_fit <- train(
+    HighPrice ~ ., data = train_set ,
+    method = "ranger",
+    trControl = cntrl,
+    tuneGrid = rf_grid,
+    num.threads = 12,
+    metric = "F1",
+    importance = 'impurity'
+  )
+  
+  # Saves output
+  save(rf_fit, file = "rf_fit_v2.RData")
+} else {
+  load("rf_fit_v2.RData")
+}
+```
+
+A grid search was initially performed over `mtyr` $\in$ {`r c(2,4,6,8,10)`}, `splitrules` $\in$ {`r c("gini", "extratrees")`}, and `min.node.size` $\in$ {`r c(2,4,6,8,10)`}. Plotting these hyper parameters, we found that the peak hasn't been reached. Hence, we updated our search space to extend to bigger `mtry` parameters (`r c(5, 10, 15, 20, 25)`) while reducing to `min.node.size` parameters (`r c(1, 5, 10)`) to the search space managable. The plot of the refined hyperparameter search space is shown in @fig-rf-hparm.
+
+As seen above, the F1 Score graph for each `min.node.size` is monotonically increasing as `mtry` increases; this suggests that `mtry` will be as high as possible. It can also be seen that the highest F1 Score under the gini `splitrule` is higher than under the extratrees `splitrule`, therefore gini is expected to be optimal. However, it is not very clear from the graphs which `min.node.size` yields the highest F1 Score using gini. The `bestTune` values from the model are: `mtry` = `r rf_fit$bestTune$mtry`; `splitrule` = `r rf_fit$bestTune$splitrule`; `min.node.size` = `r rf_fit$bestTune$min.node.size`.
+
+```{r}
+#| label: fig-rf-hparm
+#| fig-cap: "Plot of hyperparameters combinations for random forest model"
+
+# Plot the graphs
+
+# old model
+# load("rf_fit.RData")
+
+
+# Rename splitrules for the plotting headings
+rf_plot_data <- rf_fit$results |>
+  mutate(splitrule = case_match(splitrule,
+                                "gini" ~ "Gini criterion",
+                                "extratrees" ~ "Extra trees criterion"))
+
+ggplot(rf_plot_data, aes(x = mtry, y = F1, color = as.factor(min.node.size), group = min.node.size)) +
+  geom_point(shape = 15, alpha = 0.6, size = 3) + 
+  geom_line() +
+  facet_wrap(~ splitrule) + 
+  theme_minimal() +
+  theme(
+    # Legend settings
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.text = element_text(size = 12),              
+    
+    # Subplot Heading settings
+    strip.text = element_text(size = 11),
+    
+    # Main Title
+    plot.title = element_text(hjust = 0.5), 
+    
+    # Spacing
+    legend.box.spacing = unit(0.2, "cm"),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1)) +
+  labs(
+    title = "Random Forest Hyperparameter Tuning Graph",
+    x = "Number of Selected Features (mtry)",
+    y = "F1 Score (Cross-Validation)",
+    color = "Minimal Node Size"
+  ) 
+```
+
+## Boosted Tree Model (Gradient Boosting)
+
+Gradient Boosting grows a collection of trees sequentially, as each tree learns from the mistakes from the previous one. This is the opposite of random forests where the trees are grown independently. The hyperparameters controlling Gradient Boosting are: `n.trees` (number of boosting iterations), `interaction.depth` (maximum tree depth), `shrinkage` (learning rate - how much a tree corrects previous tree), and `n.minobsinnode` (minimum number of observations in each terminal node).
+
+```{r}
+# Gradient Boosted Tree
+
+if (RUN_MODELS) {
+  
+  # old serach space for hyperparameters
+  # gb_grid <- expand.grid(
+  #     n.trees           = c(100, 200, 300),
+  #     interaction.depth = c(2, 4, 6),
+  #     shrinkage         = c(0.01, 0.1),
+  #     n.minobsinnode    = c(5, 10)
+  # )
+  
+  # new serach space for hyperparameters
+  gb_grid <- expand.grid(
+    n.trees           = c(300, 500, 800),    # higher to find the peak
+    interaction.depth = c(6, 8, 10),         # deeper interactions
+    shrinkage         = c(0.1),              # 0.1 was superior
+    n.minobsinnode    = c(10)                # fixed at 10 - min impact
+  )
+  
+  set.seed(7)
+  
+  # Train an Gradient Boosted Tree model
+  # Finds optimal hyperparameters via grid search
+  gb_fit <- train(
+    HighPrice ~ .,
+    data     = train_set,
+    method    = "gbm",
+    trControl = cntrl,
+    tuneGrid  = gb_grid,
+    metric    = "F1",
+    preProcess = c("center", "scale")
+  )
+  
+  # Saves output
+  save(gb_fit, file = 'gb_fit_v2.RData')
+} else {
+  load("gb_fit.RData")
+}
+```
+
+The grid search was initially performed over `n.trees` $\in$ {`r c(100, 200, 300)`}, `interaction.depth` $\in$ {`r c(2, 4, 6)`}, `shrinkage` $\in$ {`r c(0.01, 0.1)`}, and `n.minobsinnode` $\in$ {`r c(5, 10)`}. The results are shown in @fig-gb-initial-hparm
+
+```{r}
+#| label: fig-gb-initial-hparm
+#| fig-cap: "Plot of initial hyperparameters combinations for gradient boosting model"
+#| fig-height: 3
+
+gb_results_wide <- gb_fit$results
+
+ggplot(gb_results_wide, aes(x = n.trees, y = F1, 
+                            color = as.factor(interaction.depth), 
+                            group = interaction.depth)) +
+  # Using your exact point and line style
+  geom_point(shape = 15, alpha = 0.6, size = 4) + 
+  geom_line() +
+  
+  # Replicating the 2x2 lattice grid (Node Size vs. Shrinkage)
+  facet_grid(n.minobsinnode ~ shrinkage, labeller = label_both) +
+  
+  theme_minimal() +
+  # Applying your exact legend and title settings
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey30"),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.text = element_text(face = "bold")
+  ) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1)) +
+  labs(
+    x = "Number of Boosting Iterations (n.trees)",
+    y = "F1 (Cross-Validation)",
+    color = "Maximum Tree Depth"
+  )
+
+```
+
+```{r}
+#| label: fig-gb-hparm
+#| fig-cap: "Plot of hyperparameters combinations for gradient boosting model. Constant hyperparameters are learning rate (shrinkage) = 0.1 and min. obs in node = 10."
+#| fig-height: 3
+
+
+# Plot the graphs
+
+# old model
+# load("gb_fit.RData")
+
+# new model
+load("gb_fit_v2.RData")
+
+# plot hyperparameters
+ggplot(gb_fit$results, aes(x = n.trees, y = F1, color = as.factor(interaction.depth), group = interaction.depth)) +
+  geom_point(shape = 15, alpha = 0.6, size = 4) + 
+  geom_line() +
+  theme_minimal() +
+  # legend settings
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey30"),
+  ) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1)) +
+  labs(
+    title = "Gradient Boosting Hyperparameter Tuning Graph",
+    x = "Number of Boosting Iterations",
+    y = "F1 (Cross-Validation)",
+    color = "Maximum Tree Depth"
+  )
+
+```
+
+From preliminary grid search analysis, our initial search space was close to the peak. Hence we decide to expand our search of `n.trees` and `interaction.depth` a little further. We also now fix `shrinkage` to 0.1 as it consistently better than 0.01 and `n.minobsinnode` had little impact on F1 scores so it was fixed at 10. Analysing the plot above, it is evident that `n.trees` = 800 and `interaction.depth` = 10 results in the highest F1 Score. We decide to not expand our hyper parameter search space further to prevent potentially over fitting. @fig-gb-hparm shows the hyperparameter search space that was narrowed down and expanded further. The optimal parameters from our model are: `n.trees` = `r gb_fit$bestTune$n.trees`; `interaction.depth` = `r gb_fit$bestTune$interaction.depth`; `shrinkage` = `r gb_fit$bestTune$shrinkage`; `n.minobsinnode` = `r gb_fit$bestTune$n.minobsinnode`
+
+## K-Nearest Neighbours (KNN)
+
+KNN classifies a new observation by finding the $k$ most similar training observations and taking a majority vote or average. The only hyperparameter is $k$, the number of neighbours. The features were centered and scaled to ensure that the results are not biased due to scale differences.
+
+```{r}
+# Saturated KNN
+
+if (RUN_MODELS) {
+  
+  # old search space of hyperparameters
+  # knn_grid <- expand.grid(k = seq(5,100, by = 5))
+  
+  # new search space of hyperparameters
+  knn_grid <- expand.grid(k = c(1, 3, 5, 7, 9))
+  
+  set.seed(7)
+  
+  # Train a KNN models
+  # Finds optimal hyperparameters via grid search
+  knn_fit <- train(
+    HighPrice ~ .,
+    data = train_set,
+    method = "knn",
+    trControl = cntrl,
+    tuneGrid = knn_grid,
+    metric = 'F1',
+    preProcess = c("center", "scale")
+  )
+  
+  # Save
+  save(knn_fit, file = 'knn_fit_v2.RData')
+}
+```
+
+```{r}
+# check number of features with imputation
+if (RUN_MODELS) {
+  vip_rf_imp <- vi(rf_fit) |>
+  arrange(desc(Importance)) |>
+  pull(Variable)
+
+  f1_rf_imp <- data.frame(n_vars = integer(), F1 = numeric())
+  knn_grid <- expand.grid(k = seq(5,20, by = 5))
+  
+  for (n in seq(6,20,by=2)){
+    train_sub <- train_set[, c(vip_rf_imp[1:n], "HighPrice")]
+
+    knn_fit1 <- train(
+      HighPrice ~.,
+      data = train_sub,
+      method = 'knn',
+      trControl = cntrl,
+      tuneGrid = knn_grid,
+      metric = 'F1',
+      preProcess = c('center', 'scale')
+    )
+    f1 <- max(knn_fit1$results$F1, na.rm = T)
+    f1_rf_imp <- rbind(f1_rf_imp, data.frame(n_vars = n, F1 = f1))
+  }
+
+  knn_imputation_obj <- list(n_vars_f1 = f1_rf_imp, vip_rf_imp = vip_rf_imp)
+  save(knn_imputation_obj, file = 'knn_imputation_obj.RData')
+  
+} else {
+  load('knn_imputation_obj.RData')
+}
+```
+
+```{r}
+# check number of features with permutation
+if (RUN_MODELS) {
+  pred_wrapper <- function(object, newdata) {
+    predict(object, newdata = newdata, type = "raw")
+  }
+  
+  knn_grid <- expand.grid(k = seq(5,20, by = 5))
+
+  vip_rf_perm <- vi(rf_fit,
+      method = "permute",
+      train = train_set,
+      target = "HighPrice",
+      metric = yardstick::f_meas_vec,
+      smaller_is_better = FALSE,
+      pred_wrapper = pred_wrapper) |>
+    arrange(desc(Importance)) |>
+    pull(Variable)
+
+  f1_rf_perm <- data.frame(n_vars = integer(), F1 = numeric())
+  f1 = NULL
+  train_sub = NULL
+  for (n in seq(6,20,by=2)){
+    train_sub <- train_set[, c(vip_rf_perm[1:n], "HighPrice")]
+
+    knn_fit2 <- train(
+      HighPrice ~.,
+      data = train_sub,
+      method = 'knn',
+      trControl = cntrl,
+      tuneGrid = knn_grid,
+      metric = 'F1',
+      preProcess = c('center', 'scale')
+    )
+    f1 <- max(knn_fit2$results$F1, na.rm = T)
+    f1_rf_perm <- rbind(f1_rf_perm, data.frame(n_vars = n, F1 = f1))
+  }
+
+  knn_permutation_obj <- list(n_vars_f1 = f1_rf_perm, vip_rf_perm = vip_rf_perm)
+  
+  save(knn_permutation_obj, file = 'knn_permutation_obj.RData')
+} else {
+  load("knn_permutation_obj.RData")
+}
+```
+
+```{r}
+# train feature selected knn model
+if (RUN_MODELS) {
+  load("knn_permutation_obj.RData")
+  load("knn_imputation_obj.RData")
+  
+  # which.max(knn_permutation_obj$n_vars_f1$F1)
+  # We use permutation since it has higher F1 score
+  cap_selections <- knn_permutation_obj$n_vars_f[which.max(knn_permutation_obj$n_vars_f1$F1),  1]
+  
+  knn_grid <- expand.grid(k = seq(5,20, by = 5))
+  
+  knn_new_fit <- train(
+    HighPrice ~.,
+    data = train_set[,c(knn_permutation_obj$vip_rf_perm[1:cap_selections], 'HighPrice')],
+    method = 'knn',
+    trControl = cntrl,
+    tuneGrid = knn_grid,
+    metric = 'F1',
+    preProcess = c('center', 'scale')
+  )
+
+  save(knn_new_fit, file = 'knn_new_fit_v2.RData')
+}
+```
+
+Multiple KNN models were run with different combinations of potential variables. The number of variable importance variables from the Random Forest model was used to run KNN models and their F1 Scores were plotted with the number of variables selected. A search from of the range from the first 6 variables selected to 20 variables was performed. This was repeated using permutation based variable importance ranking and F1 scores stored. @fig-knn-vip shows the behaviour of F1 score with different combinations of features.
+
+```{r}
+load("knn_permutation_obj.RData")
+load("knn_imputation_obj.RData")
+```
+
+```{r}
+#| label: fig-knn-vip
+#| fig-cap: "k-NN variable feature selection"
+#| fig-height: 2
+
+df_perm <- knn_permutation_obj$n_vars_f1
+df_imp <- knn_imputation_obj$n_vars_f1
+
+p1 <- ggplot(df_perm, aes(x = n_vars, y = F1)) +
+  # line and points
+  geom_line(color = "#619CFF", linewidth = 1) +
+  geom_point(shape = 15, size = 3, color = "#619CFF") +
+  
+  # optimal point in red
+  geom_point(data = df_perm[which.max(df_perm$F1), ], 
+             shape = 15, size = 3, color = "firebrick3") +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+  ) +
+  labs(
+    title = "Permutation",
+    x = "Number of Top Features Included",
+    y = "Cross-Validated F1 Score"
+  )
+
+
+p2 <- ggplot(df_imp, aes(x = n_vars, y = F1)) +
+  # line and points
+  geom_line(color = "#619CFF", linewidth = 1) +
+  geom_point(shape = 15, size = 3, color = "#619CFF") +
+  
+  # optimal point in red
+  geom_point(data = df_imp[which.max(df_imp$F1), ], 
+             shape = 15, size = 3, color = "firebrick3") +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+  ) +
+  labs(
+    title = "Impurity",
+    x = "Number of Top Features Included",
+    y = NULL
+  )
+
+combined_plot <- (p1 + p2) + 
+  plot_annotation(
+    title = "K-NN Feature Subset Optimization Comparison",
+    theme = theme(
+      plot.title = element_text(hjust = 0.5),
+    )
+  )
+
+combined_plot
+```
+
+It is clear the the first 10 variables from the permutation based importance ranking yielded the highest F1 Score of `r max(knn_permutation_obj$n_vars_f1$F1)`. A KNN model was then run using the 10 variables as follows: `r knn_permutation_obj$vip_rf_perm[1:10]`. The hyperparameter tuning graph for this knn feature selected model is shown in @fig-knn-hparm
+
+```{r}
+#| label: fig-knn-hparm
+#| fig-cap: "Plot of hyperparameters combinations for feature selected KNN model."
+#| fig-height: 2
+
+load("knn_new_fit_v2.RData")
+
+# plot hyperparameters
+ggplot(knn_new_fit$results, aes(x = k, y = F1)) +
+  geom_line(color = "#619CFF") + 
+  geom_point(shape = 15, alpha = 0.8, size = 3, color = "#619CFF") + 
+  theme_minimal() +
+
+  # legend settings
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5),
+  ) +
+  labs(
+    title = "K-Nearest Neighbors Hyperparameter Tuning Graph",
+    x = "Number of Neighbors (k)",
+    y = "F1 (Cross-Validation)"
+  )
+```
+
+From the above plot, the highest F1 Score yielded is around $k = 10$, but we can confirm exact value by extracting it from the model: `r knn_new_fit$bestTune$k`. We show that variable selection indeed did improve the basic KNN model that uses all variables. A saturated KNN model was trained and it's performance metrics were compared against other models, shown in @tbl-all-metrics and @fig-model-comparison.All the metrics have noticeably improved, besides specificity which decreased from **0.952** to **0.947**. This is not a very stressful issue since the increase of recall from **0.593** to **0.733** definitely outweighs it.
+
+## Discussion on Best Model
+
+The table below presents the cross-validated performance metrics for all four models at τ=0.5.
+
+```{r}
+#| label: tbl-all-metrics
+
+# get the f1sd from model fit
+get_f1sd <- function(model_fit) {
+  f1sd <- model_fit$results |> 
+    inner_join(model_fit$bestTune) |>
+    pull(F1SD)
+  
+  f1sd
+}
+
+# this function is sort of hard coded
+# gets all the metrics
+get_all_metrics <- function() {
+  # reload model fits
+  # using updated models (v2)
+  load('en_fit_v2.RData')
+  load('rf_fit_v2.RData')
+  load('gb_fit_v2.RData')
+  load('knn_new_fit_v2.RData')
+  load('knn_fit_v2.RData')
+  
+  # attach f1sd
+  en_metrics <- evaluate_model_metrics(en_fit$pred, tau = 0.5, "Elastic-net")$metrics |>
+    mutate(F1_SD = get_f1sd(en_fit))
+  
+  rf_metrics <- evaluate_model_metrics(rf_fit$pred, tau = 0.5, "Random Forest")$metrics |>
+    mutate(F1_SD = get_f1sd(rf_fit))
+  
+  gb_metrics <- evaluate_model_metrics(gb_fit$pred, tau = 0.5, "Gradient Boosting")$metrics |>
+    mutate(F1_SD = get_f1sd(gb_fit))
+  
+  knn_vip_metrics <- evaluate_model_metrics(knn_new_fit$pred, tau = 0.5, "K-NN Feature Selected")$metrics |>
+    mutate(F1_SD = get_f1sd(knn_new_fit))
+  
+  knn_all_metrics <- evaluate_model_metrics(knn_fit$pred, tau = 0.5, "K-NN Saturated")$metrics |> 
+    mutate(F1_SD = get_f1sd(knn_fit))
+  
+  all_metrics <- bind_rows(en_metrics, rf_metrics, gb_metrics, knn_vip_metrics, knn_all_metrics) |>
+    relocate(F1_SD, .after = F1)
+  
+  return(all_metrics)
+}
+
+
+all_metrics <- get_all_metrics()
+
+all_metrics |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  kable(booktabs = TRUE, align = "c", caption = "Model Performance Comparison with F1 Stability") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE)
+```
+
+```{r}
+#| label: fig-model-comparison
+#| fig-cap: "Comparison of Cross-Validated F1 Scores. Error bars represent 1 standard deviation."
+#| fig-height: 2
+
+ggplot(all_metrics, aes(x = reorder(Model, F1), y = F1)) +
+  geom_col(fill = "#619CFF", alpha = 0.8, width = 0.7) +
+  
+  # Error Bars using the F1_SD 
+  geom_errorbar(aes(ymin = F1 - F1_SD, ymax = F1 + F1_SD), 
+                width = 0.2, color = "grey30", linewidth = 0.7) +
+  
+  #  numeric labels 
+  geom_text(aes(label = round(F1, 3)), 
+            hjust = -0.5, size = 4, fontface = "bold") +
+  
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Final Model Performance Comparison",
+    x = NULL,
+    y = "Mean F1 Score"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+Ignoring the `F1_SD` column for now, the Gradient Boosting model performed best across all metrics besides specificity, where it tied with Random Forest.
+
+The Elastic-net model did perform reasonably well with F1 of **0.769** and AUROC of **0.939**, this shows that a linear model can capture meaningful information from the data, just less effectively than tree-based models.
+
+KNN Saturated performed the worst across all the metrics. The low recall of **0.626** suggests that the model struggles to identify true high price listings, most likely due to the curse of dimensionality (KNN uses distances to predict but this method becomes less effective as dimensions increase).
+
+Meanwhile, the KNN Feature Selected performed similar to Elastic-net with the same F1 Score of **0.893**.
+
+Random Forest and Gradient Boosting perform very similarly across all the metrics. Looking at the `F1_SD` column now, Gradient Boosting has lower F1 standard deviation (**0.021**) than Random Forest (**0.034**). This combination of highest F1 Score and lowest F1 standard deviation is enough to conclude that the Gradient Boosting model is the most accurate and reliable one out of the four models.
+
+# Threshold Optimization
+
+```{r}
+load('en_fit_v2.RData')
+load('rf_fit_v2.RData')
+load('gb_fit_v2.RData')
+load('knn_fit_v2.RData')
+
+gb_pred <- gb_fit$pred
+```
+
+## Optimal Decision Rule Threshold & CV ROC Curve
+
+```{r warning=F}
+# Find Optimal Tau
+taus = seq(0,0.999,0.001)
+F1_list <- vector(length = length(taus))
+
+for(i in 1:length(taus)) {
+  F1_list[i] <- evaluate_model_metrics(gb_pred, tau = taus[[i]])$metrics |>
+    pull(F1)
+}
+
+max_tau_index <- which.max(F1_list)
+optimal_tau <- taus[max_tau_index]
+max_F1 <- F1_list[max_tau_index]
+```
+
+```{r}
+#| label: fig-tau-roc
+#| fig-cap: "Left: plot of f1 score vs probability threshold (tau). Right: plot of CV ROC curve."
+
+
+# Plot optimal tau
+plot_data <- data.frame(tau = taus, F1 = F1_list)
+
+p_tau <- ggplot(plot_data, aes(x = tau, y = F1)) +
+  geom_line(color = "#619CFF", linewidth = 0.6) +
+  
+  geom_vline(xintercept = optimal_tau, color = "firebrick3", linetype = "dashed") +
+  theme_minimal() +
+  # title and label setttings
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+  ) +
+  
+  labs(
+    title = "Probability Threshold Optimization",
+    x = "Probability Threshold (tau)",
+    y = "Cross-Validated F1 Score"
+  )
+
+
+# Extract Optimal tau metrics
+optimal_tau_obj <- evaluate_model_metrics(gb_pred, tau = optimal_tau)
+optimal_tau_metrics <- optimal_tau_obj$metrics
+optimal_tau_roc <- optimal_tau_obj$roc
+
+opt_sens <- optimal_tau_metrics$Recall
+opt_spec <- optimal_tau_metrics$Specificity
+
+roc_data <- data.frame(
+  fpr = 1 - optimal_tau_roc$specificities,
+  tpr = optimal_tau_roc$sensitivities
+)
+
+
+# plot roc
+p_roc <- ggplot(roc_data, aes(x = fpr, y = tpr)) +
+  # diagonal reference line
+  geom_segment(x = 0, y = 0, xend = 1, yend = 1, 
+               linetype = "dotted", color = "grey50") +
+  
+  # roc curve
+  geom_path(color = "#619CFF", linewidth = 0.7) +
+  
+  # optimal point
+  geom_point(x = 1 - opt_spec, y = opt_sens, 
+             color = "maroon", size = 4, shape = 18) +
+  
+  # labelling
+  annotate("text", x = (1 - opt_spec) + 0.05, y = opt_sens - 0.05, 
+           label = paste0("F1 = ", round(max_F1, 3), "\ntau = ", round(optimal_tau, 3)),
+           color = "maroon", fontface = "bold", hjust = 0) +
+  
+  # square aspect ratio
+  coord_fixed() +
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "CV ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  )
+
+# combine plots and display
+combined_diagnostic <- (p_tau + p_roc)
+
+combined_diagnostic
+```
+
+A plot of the performance (F1 Scores) of our Gradient Boosting model for different decision rule thresholds($\tau$) in the range of 0 to 1 is shown in @fig-tau-roc.The optimal $\tau$ is found to be `r optimal_tau` with the corresponding F1 Score of `r max_F1`.
+
+The specificity and sensitivity metrics corresponding to the optimal $\tau$ are `r opt_spec` and `r opt_sens` respectively. The auroc metric for optimal tau is `r round(auc(optimal_tau_roc))`
+
+## Performance of model on Test set
+
+The performance metrics of the Gradient Boosting model on the test set are as follows:
+
+```{r}
+#| label: tbl-test-metric
+#| tbl-cap: "Test set metrics"
+
+# Predict and Evaluate Test set
+gb_test_prob <- predict(gb_fit, newdata = test_set, type = "prob")
+gb_test_obj <- list(Yes = gb_test_prob$Yes, obs = test_set$HighPrice)
+gb_test_metrics <- evaluate_model_metrics(gb_test_obj, model_name = "Gradient Boosting")$metrics
+
+gb_test_metrics |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  kable(booktabs = TRUE, align = "c") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE)
+
+```
+
+The model accuracy of **0.897** means that the model correctly classified **89.7**% of the listings, which is the large majority of them. The F1 Score of **0.796** suggests a good balance between precision and recall. The precision of **0.824** reflects that **82.4**% of the listings predicted as high price were correctly classified. The recall of **0.771** shows that out of all the high price listings, the model correctly classified **77.1**% of them. Specificity of **0.942** indicates that out of all the low price listings, **94.2**% of them were actually predicted to be low price. Lastly, the AUROC of **0.954** suggests that the model is good at ranking high price listings above low price ones across all thresholds.
+
+The recall is much lower than the precision and specificity; this shows that the model is a bit hesitant in predicting listings as high price. This makes sense as there is a slight imbalance in the `HighPrice` variable.
+
+# Interpretation and Error Analysis
+
+## Variable importance plots
+
+```{r}
+load("gb_fit_v2.Rdata")
+
+f1_metric <- function(truth, estimate) {
+  lvls <- levels(truth)
+  pred_class <- factor(ifelse(estimate >= 0.5, lvls[2], lvls[1]), levels = lvls)
+  
+  
+  caret::F_meas(data = pred_class, reference = truth, relevant = lvls[2])
+}
+```
+
+```{r}
+# Extract best number of trees
+best_n_trees <- gb_fit$bestTune$n.trees
+
+# Impurity-based Importance
+p_imp <- vip(gb_fit, method = "model") + 
+  labs(title = "Impurity Importance (GBM)") +
+  theme_minimal()
+
+# Permutation-based Importance
+set.seed(7)
+train_sample <- train_set |> slice_sample(n = 2000)
+
+x_train_sample <- train_sample |> select(-HighPrice)
+y_train_sample <- train_sample$HighPrice
+
+# function for permutation
+gbm_wrapper <- function(object, newdata) {
+  predict(object, newdata = newdata, n.trees = best_n_trees, type = "prob")[, "Yes"]
+}
+
+p_perm <- vi_permute(
+  object = gb_fit,
+  feature_names = colnames(x_train_sample),
+  train = x_train_sample,
+  target = y_train_sample,
+  metric = f1_metric,
+  pred_wrapper = gbm_wrapper,
+  nsim = 5,
+  smaller_is_better = FALSE
+) |> vip() + 
+  labs(
+    title = "Permutation Importance (F1 Metric)",
+    x = "Decrease in F1 Score",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-var-importance
+#| fig-cap: "Variable importance comparison graph of gradient boosting. Impurity is based on Gini/Impurity. Permutation is based on F1-Score on a subset of the train set"
+
+# Impurity Plot
+p_imp_plot <- p_imp + 
+  geom_col(fill = "#619CFF") + 
+  labs(
+    title = "Impurity",
+    x = "Relative Importance",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13),
+  )
+
+#  Permutation Plot
+p_perm_plot <- p_perm + 
+  geom_col(fill = "firebrick3") + 
+  labs(
+    title = "Permutation",
+    x = "Decrease in F1 Score",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13),
+  )
+
+
+p_imp_plot + p_perm_plot + 
+  plot_annotation(
+    title = "Variable Importance Comparison: Gradient Boosting",
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, color = "grey30")
+    )
+  )
+```
+
+The above plots present variable importance for the Gradient Boosting model using impurity based importance (left) and permutation based importance (right).
+
+Both the models show that the listing size is extremely influential, with `accommodates` and `bathrooms` appearing in the top four across both plots. This logically makes sense as larger listings can host more guests so they demand higher prices.
+
+The location variables `longitude` and `latitude` also appear to be influential in predicting `HighPrice`. This supports the well-known fact that location is a driver of price. Even though `longitude` ranks first in the permutation plot despite ranking fourth in the impurity plot, suggesting that location may not create as many splits in the trees, but when its information is removed, the model suffers a lot.
+
+## Partial Dependence Plots
+
+Below are the partial dependence plots of `bedrooms`, `bathrooms`, `accommodates` and `longitude`, they present the marginal effect of each variable on the predicted probability of a high price listing, holding all other variables constant:
+
+```{r}
+#| label: fig-pd-plot
+#| fig-cap: "Partial Dependence Plots"
+
+top_vars <- c("bedrooms", "bathrooms", "accommodates", "longitude") 
+
+# create pds
+pdp1 <- partial(gb_fit, pred.var = top_vars[1], n.trees = best_n_trees, prob = TRUE) |> 
+  autoplot() + theme_minimal() + labs(y = "Prob(HighPrice)")
+
+pdp2 <- partial(gb_fit, pred.var = top_vars[2], n.trees = best_n_trees, prob = TRUE) |> 
+  autoplot() + theme_minimal() + labs(y = "Prob(HighPrice)")
+
+pdp3 <- partial(gb_fit, pred.var = top_vars[3], n.trees = best_n_trees, prob = TRUE) |> 
+  autoplot() + theme_minimal() + labs(y = "Prob(HighPrice)")
+
+pdp4 <- partial(gb_fit, pred.var = top_vars[4], n.trees = best_n_trees, prob = TRUE) |> 
+  autoplot() + theme_minimal() + labs(y = "Prob(HighPrice)")
+
+grid.arrange(pdp1, pdp2, pdp3, pdp4, ncol = 2)
+
+```
+
+`bedrooms`: The probability of being high price decreases suddenly from around 0.78 (listings with 1-2 bedrooms) to around 0.68 (listings with 4 or more bedrooms), and it stays constant. This is an interesting finding since one would expect that more bedrooms would demand higher prices. However, this may reflect that very large listings could be found in lower-cost locations, so the prices are lowered per room to be able to compete with high price listings.
+
+`bathrooms`: The pattern of this plot is similar to that of `bedrooms`', with a probability of around 0.80 (1-2 bathrooms) sharply decreasing to around 0.55 (4 or more bathrooms), and then it stays constant. The reasoning behind this could be similar to `bedrooms`'s reasoning since more `bedrooms` usually means more `bathrooms`.
+
+`accommodates`: The probability decreases from a little over 0.80 (accommodating 1-2 guests) to about 0.60 (accommodating 10-12 guests), then slightly increases until it reaches 0.65 (accommodating 16 guests). This initial drop in probability could be explained by the possibility that larger listings tend to be in low price locations, similar to `bedrooms` and `bathrooms`. It makes sense to pool these three variables together since they represent the size of the listing. However, the increase may be due to the hosts' preferences and them thinking that at some point (around 10), the number of people the listing accommodates outweighs the location, hence price starts increasing.
+
+`longitude`: The probability starts around 0.60 (around longitude 18.3), has a small decline but then rises sharply to around 0.85 (around longitude 18.5), and then remains around 0.85. This suggests that areas to the east are more likely to have high price listings.
+
+## False Positive and Negatives
+
+The table below presents the five most confident false positives and five most confident false negatives from the test set predictions.
+
+```{r}
+#| label: tbl-fp-fn
+
+# add predictions and probabilities to test set
+error_analysis <- test_set |>
+  mutate(
+    prob_yes = predict(gb_fit, newdata = test_set, type = "prob")$Yes,
+    pred_class = ifelse(prob_yes >= 0.5, "Yes", "No") # assuming tau is 0.5
+  )
+
+# False Positives 
+false_positives <- error_analysis |>
+  filter(pred_class == "Yes", HighPrice == "No") |>
+  arrange(desc(prob_yes)) |> # Check the "most confident" errors
+  head(5)
+
+# False Negatives 
+false_negatives <- error_analysis |>
+  filter(pred_class == "No", HighPrice == "Yes") |>
+  arrange(prob_yes) |> # Check the "most confident" errors
+  head(5)
+
+# Combine and Display
+error_summary <- bind_rows(
+  mutate(false_positives, ErrorType = "False Positive"),
+  mutate(false_negatives, ErrorType = "False Negative")
+)
+
+error_summary |>
+  select(ErrorType, prob_yes, HighPrice, bedrooms, bathrooms, neighbourhood_ward, room_type) |>
+  kable(caption = "Error Analysis: 5 FPs and 5 FNs") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+**False Positives:** The model predicted high price with extreme probabilities (0.987-0.999) for listings that were actually low price. All the five observations are entire/apartment listings, with 3-4 bedrooms and 2-3.5 bathrooms. These listings have attributes the model associates with high price, but they are not.
+
+**False Negatives:** On the other hand, the model also predicted low price with extreme probabilities (0.001-0.003) for listings that were actually hihg price. All the observations are again entire/apartment listings, with 1-2 bedrooms and 1-2 bathrooms. This suggests that the model associates smaller listings with lower prices, however, these listings could have been of high price due to their intimate nature geared towards couples.
+
+# Conclusion
+
+All in all, from the four models used to predict whether a Cape Town Airbnb listing is high price or not (Elastic-net, Random Forest, Gradient Boosting, and K-Nearest Neighbours), the Gradient Boosting model was selected. Given its cross-validated F1 score of **0.817** exceeded the rest, and lowest F1 standard deviation of **0.021**, this model has proved to be the strongest.
+
+Initially, a threshold of 𝜏 = 0.5 was used, however, it was found to not be optimal for maximising F1. The optimal threshold was then found to be 0.374, yielding a cross-validated F1 Score of **0.821**. Evaluating this model on the test set at this threshold resulted in F1 Score of 0.796 and an AURIC of **0.954**, showing that the model performs well on unseen data.
+
+The variable importance and partial dependence plots reveal that the size of a listing and its location are influential aspects driving high price of the listings.
+
+Through error analysis, it can be concluded that the misclassified predictions were due to listings whose attributes were inconsistent with their price, highlighting a limitation of the model; it can not capture factors that can not be observed, such as host preferences while pricing.
