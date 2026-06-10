@@ -40,13 +40,11 @@ that are a good bargain for their price.
 
 # Supervised Learning
 
-We applied supervised learning algorithms (Elastic Net, Random Forest, Gradient Boosting Models and K-Nearest Neighbours) to predict if an Airbnb property listing would be expensive (HighPrice). By analysing our Gradient Boosting Model, we found that influential features for our task to be features that relate to the location and physical capacity of the properties.
-
-<img width="1600" height="972" alt="image" src="https://github.com/user-attachments/assets/b0007a77-ca81-49f8-8e9c-2bf718ce7297" />
+We applied supervised learning algorithms (Elastic Net, Random Forest, Gradient Boosting Models and K-Nearest Neighbours) to predict if an Airbnb property listing would be expensive (HighPrice). The Gradient Boosting Model has been found to perform best at predicting expensive property listings. By analysing our Gradient Boosting Model, we found that influential features for our task to be features that relate to the location and physical capacity of the properties.
 
 <img width="1604" height="1074" alt="image" src="https://github.com/user-attachments/assets/51d73f6a-ecbf-4357-be70-9d3e14b9aeee" />
 
-
+<img width="1600" height="972" alt="image" src="https://github.com/user-attachments/assets/b0007a77-ca81-49f8-8e9c-2bf718ce7297" />
 
 ## Authors:
 - Kelvin Wei 
