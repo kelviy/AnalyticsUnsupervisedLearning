@@ -44,6 +44,9 @@ We applied supervised learning algorithms (Elastic Net, Random Forest, Gradient 
 
 <img width="1600" height="972" alt="image" src="https://github.com/user-attachments/assets/b0007a77-ca81-49f8-8e9c-2bf718ce7297" />
 
+<img width="1604" height="1074" alt="image" src="https://github.com/user-attachments/assets/51d73f6a-ecbf-4357-be70-9d3e14b9aeee" />
+
+
 
 ## Authors:
 - Kelvin Wei 
